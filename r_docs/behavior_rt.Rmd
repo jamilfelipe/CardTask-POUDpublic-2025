@@ -1,0 +1,28 @@
+---
+title: "behavior"
+author: "jfpb"
+date: "2025-01-03"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_knit$set(root.dir = rprojroot::find_rstudio_root_file())
+
+```
+
+```{r}
+library(tidyverse)
+rt_tib <- readr::read_tsv("data/participants_rt.tsv") |> rename(pid = id) 
+cov_tib <- readr::read_csv("data/covariates.csv") 
+
+beh_tib <- full_join(rt_tib, cov_tib, by = "pid") |> mutate(
+  group = if_else(pid>700,"control","POUD")
+)
+```
+```{r}
+beh_lm <- afex::aov_car(response_time ~ group + sex + cigs + Error(pid) , data=beh_tib, anova_table = "pes", factorize = FALSE)
+summary(beh_lm)
+anova(beh_lm)
+```
+

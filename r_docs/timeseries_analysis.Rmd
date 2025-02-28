@@ -1,0 +1,331 @@
+---
+title: "time series analysis"
+author: "jb"
+date: "4/26/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_knit$set(root.dir = rprojroot::find_rstudio_root_file())
+# Suppress summarise info (grouping warning)
+#options(dplyr.summarise.inform = FALSE)
+```
+
+```{r import-data, include=FALSE}
+library(tidyverse)
+library(ggpubr)
+library(rstatix)
+library(lme4)
+ts_tib <- readr::read_csv("data/preproc2_roi_timeseries.csv")
+cov_tib <- readr::read_csv("data/covariates5.csv") 
+```
+
+### Plots
+```{r time-series-plots, fig.show='hold', results='hold'}
+roi_plot_list <- c("lstriat","rstriat","lvmpfc","rvmpfc","lpcc","rpcc","lamyg","ramyg")
+#group data by subject, then compute gain-loss per timepoint/bin
+ts_bysub <- ts_tib |> 
+  filter((event %in% c("gain","loss","neut")) & (seconds<=12)) |> 
+  group_by(id, group, roi, event, tr, seconds) |> 
+  dplyr::summarise(
+    subsig = mean(perc_change) #percent value
+  ) |> ungroup() |> mutate(
+  group = forcats::as_factor(group), 
+  event = forcats::as_factor(event),
+  roi = forcats::as_factor(roi),
+  ) |> spread (event, subsig) |>
+  mutate(gainvsneu=gain-neut, lossvsneu=loss-neut, gainvsloss = gain-loss) |>
+  gather("event","subsig", -id, -roi, -group, -tr, -seconds)
+  # use lines above to compute new measures (e.g. gain-loss)
+
+
+#then average across subs
+ts_summary <- ts_bysub |> 
+  group_by(group, roi, event, tr, seconds) |> 
+  dplyr::summarise(
+    sigchange = mean(subsig),
+    ci.low = ggplot2::mean_cl_boot(subsig)$ymin,
+    ci.upp = ggplot2::mean_cl_boot(subsig)$ymax,
+  ) |> ungroup()
+
+for (oneroi in roi_plot_list) { #unique(ts_summary$roi)) {
+  # plot gainv loss in one plot, group by facet
+  pgvl <- ts_summary |> 
+    filter((roi==oneroi)&(seconds<=12)&(event %in% c("gain","loss"))) |> 
+    ggplot(aes(x = seconds, y = sigchange, color=event, fill=event, ymin=ci.low, ymax=ci.upp)) + 
+      geom_point(stat = "identity",size=.5) +
+      geom_line(stat = "identity") +
+      geom_ribbon(alpha=.25, color=NA) +
+      theme_classic(base_size = 10) + labs(title=element_blank(), y = "Signal Change (A.U.)", x = "time after outcome onset (s)") +
+      scale_color_manual(values = c("#49997c","#ae3918")) + 
+      scale_fill_manual(values = c("#49997c","#ae3918")) +  
+      scale_x_continuous(breaks=c(0,3,6,9,12)) +
+      facet_grid(. ~ group)
+  print(pgvl)
+  imgfile <- sprintf("images/%s_gvl_timeseries.png", oneroi)
+  ggsave(filename = imgfile, plot = pgvl, device = "png", width = 4, height = 2, units = "in", dpi = 300)
+  
+  #plot groups in one plot, gain/loss by facet
+pgrp <- ts_summary |> 
+    filter((roi==oneroi)&(seconds<=12)&(event %in% c("gain","loss"))) |> 
+    ggplot(aes(x = seconds, y = sigchange, color=group, fill=group, ymin=ci.low, ymax=ci.upp)) + 
+      geom_point(stat = "identity",size=.5) +
+      geom_line(stat = "identity") +
+      geom_ribbon(alpha=.25, color=NA) +
+      theme_classic(base_size = 10) + labs(title=element_blank(), y = "Signal Change (A.U.)", x = "time after outcome onset (s)") +
+      scale_fill_manual(values = c("#387FE5","#CE2C1E")) + 
+      scale_color_manual(values = c("#387FE5","#CE2C1E")) + 
+      scale_x_continuous(breaks=c(0,3,6,9,12)) +
+      facet_grid(. ~ event)
+  print(pgrp)
+  imgfile <- sprintf("images/%s_grp_timeseries.png", oneroi)
+  ggsave(filename = imgfile, plot = pgrp, device = "png", width = 4, height = 2, units = "in", dpi = 300)
+}
+# ts_summary |> #show the group-level data in a table
+#   knitr::kable(caption = "all subs mean sig", digits = 3) |> 
+#   kableExtra::kable_styling(full_width = FALSE)
+
+```
+
+```{r fig-images}
+oneroi <- c("lstriat","rstriat")
+pgrp <- ts_summary |> 
+    filter((roi %in% oneroi)&(seconds<=12)&(event %in% c("gain","loss"))) |> 
+    mutate(roi = case_when(
+      roi == "lstriat" ~ "left VS",
+      roi == "rstriat" ~ "right VS"
+    )) |> 
+    ggplot(aes(x = seconds, y = sigchange, color=group, fill=group, ymin=ci.low, ymax=ci.upp)) + 
+      geom_point(stat = "identity",size=.5) +
+      geom_line(stat = "identity") +
+      geom_ribbon(alpha=.25, color=NA) +
+      scale_fill_manual(values = c("#387FE5","#CE2C1E")) + 
+      scale_color_manual(values = c("#387FE5","#CE2C1E")) + 
+      scale_x_continuous(breaks=c(0,3,6,9,12)) +
+      facet_grid(rows = vars(event), cols = vars(roi))
+pgrp <- pgrp + theme_classic(base_size = 8) + labs(title=element_blank(), y = "Signal Change (A.U.)", x = "time after outcome onset (s)") 
+
+imgfile <- sprintf("images/%s_grp_timeseries.png", paste(oneroi,collapse = "_"))
+ggsave(filename = imgfile, plot = pgrp, device = "png", width = 3.5, height = 2, units = "in", dpi = 300)
+
+```
+
+## Plot Area under the curve
+```{r auc-stats, fig.show='hold', results='hold'}
+#auc_trialwise <- ts_tib |> 
+auc_bysub <- ts_bysub |> 
+  filter((event %in% c("gain","loss")) & (tr<13)) |> 
+  group_by(id,group,roi,event) |> 
+  dplyr::summarise(
+    sig_auc = DescTools::AUC(seconds, subsig, method = "trapezoid")
+  ) |> #spread(event,sig_auc) |> 
+  #mutate(gainvsloss=gain-loss) |> 
+  #gather("event","sig_auc", -id, -group, -roi) |> 
+  ungroup()
+auc_summary <- auc_bysub |> 
+  group_by(group,roi,event) |> 
+  dplyr::summarise(
+    mean_auc = mean(sig_auc),
+    mean_auc.ci.low = ggplot2::mean_cl_boot(sig_auc)$ymin, 
+    mean_auc.ci.upp = ggplot2::mean_cl_boot(sig_auc)$ymax,
+  ) |> ungroup()
+#auc_summary |> #show the group-level data in a table
+#  knitr::kable(caption = "area under the curve (trapezoidal)", digits = 4) #|>
+#  kableExtra::kable_styling(full_width = FALSE)
+
+for (oneroi in unique(ts_summary$roi)) {
+  roi_summary <- auc_summary |> filter(roi==oneroi)
+  p1 <- auc_bysub |> ungroup() |> filter(roi==oneroi) |> 
+    ggplot(aes(x = event, y = sig_auc, color=group)) + 
+      geom_jitter(position = position_jitterdodge(dodge.width = .4, jitter.width = .1, jitter.height = 0), shape = 1) +
+      geom_point(data = roi_summary,
+                 aes(x = event, y = mean_auc, group = group),
+                 stat="identity", 
+                 position = position_dodge(.4),
+                 color = "black",
+                 show.legend = FALSE) +
+      geom_errorbar(data = roi_summary,
+                    aes(x = event, y = mean_auc, group = group, 
+                        ymin=mean_auc.ci.low, ymax=mean_auc.ci.upp),
+                    stat="identity", width=.1,
+                    position = position_dodge(.4),
+                    color = "black",
+                    show.legend = FALSE) +
+      #coord_cartesian(ylim = c(-5, 3)) + 
+      theme_classic(base_size = 18) + labs(title=oneroi, y = "Area under the curve", x = "valence") + scale_color_manual(values = c("#387FE5","#CE2C1E"))
+  ggsave(plot = p1, filename = paste("images/",oneroi,"_auc.png"),
+         dpi = 300)
+  print(p1)
+  print(oneroi)
+  auc_bysub |> ungroup() |> filter(roi==oneroi) |> 
+    afex::aov_4(sig_auc ~ group*event + (event|id), data = _)
+}  
+```
+
+## AUC stats
+- since shape of response over time may be an issue, use AUC rather than indiv timepoints
+1. ~~GroupXValence, in each roi~~ 
+- do gain and loss separately because a group difference in one response is important even without the interaction.  
+~~2. logistic regression - group as function of valenceXroi~~ (redundant).  
+```{r mixed-effects-auc}
+for (oneroi in unique(auc_bysub$roi)) {
+  for (oneevent in c("gain","loss")) {
+    filt_auc <- auc_bysub |> 
+      filter((roi==oneroi) & (event == oneevent))
+    p1 <- filt_auc |> ggqqplot("sig_auc")  +
+      facet_grid(event ~ group, labeller = "label_both")
+    #print(p1)
+    
+    # lm_fit <- auc_bysub |> 
+    #   filter((roi==oneroi) & (event == "gainvsloss")) |> 
+    #   lm(data = _,sig_auc ~ group)
+    # anova_fit <- filt_auc |> 
+    #   rstatix::anova_test(data = _, dv = sig_auc, wid = id, between = group, within = event)
+    # lm_fit <- auc_bysub |>
+    #   filter((roi==oneroi) & (event == oneevent)) |>
+    #   lm(data = _,sig_auc ~ group)
+    # anova_fit <- filt_auc |>
+    #   rstatix::anova_test(data = _, dv = sig_auc, between = group)
+    print(filt_auc |>
+      rstatix::t_test(data = _,sig_auc ~ group,var.equal = T) |>
+      knitr::kable(caption = paste(oneroi,oneevent)) |>
+      kableExtra::kable_styling(full_width = FALSE))
+
+    # anova_fit <- filt_auc |>
+    #   rstatix::anova_test(data = _, dv = sig_auc, between = group)
+    
+    # cat("\n")
+    # print(oneroi)
+    # print(anova(lm_fit))
+    # print(get_anova_table(anova_fit))
+    
+    # fit <- auc_bysub |> filter((roi==oneroi) &(event == "gainvsloss")) |> 
+    #   glm(data = _,group ~ sig_auc + 1, family=binomial)
+    # print(summary(fit))
+  }
+}
+```
+
+
+## full anova on raw values. 
+
+```{r anova-raw, fig.show='hold', results='hold'}
+for (oneroi in c("lstriat","rstriat","lvmpfc","rvmpfc")) {
+  filt_ts <- ts_bysub |> 
+    filter((roi==oneroi) & 
+           (event %in% c("gain","loss")) &
+           (tr<=12)) |> 
+    mutate(perc_change100 = subsig,
+           group = forcats::as_factor(group),
+           event = forcats::as_factor(event),
+           tr = forcats::as_factor(tr)) #code tr as a factor bc of non-linear effect on signal
+    
+  p1 <- filt_ts |> ggqqplot("perc_change100")  +
+    facet_grid(event ~ group, labeller = "label_both")
+  print(oneroi)
+  print(p1)
+  
+  me_fit <- filt_ts |> ungroup() |> 
+            rstatix::anova_test(data = _, dv = perc_change100, wid = id, within = c(tr,event),
+                                between = group)
+  print(rstatix::get_anova_table(me_fit))
+}  
+```
+##  anova on raw values, gain and loss separate. 
+
+```{r gainlossanova-raw, fig.show='hold', results='hold'}
+for (oneroi in c("lstriat","rstriat","lvmpfc","rvmpfc")) {
+  filt_ts <- ts_bysub |> 
+    filter((roi==oneroi) & 
+           (event %in% c("gain")) &
+           (tr<=12)) |> 
+    mutate(perc_change100 = subsig,
+           group = forcats::as_factor(group),
+           tr = forcats::as_factor(tr)) #code tr as a factor bc of non-linear effect on signal
+  filt_ts <- full_join(filt_ts, cov_tib, by = "id")
+  me_fit <- filt_ts |> ungroup() |> 
+            rstatix::anova_test(data = _, dv = perc_change100, wid = id, 
+                                within = c(tr),
+                                between = group)
+  print(paste(oneroi,"gain"))
+  print(rstatix::get_anova_table(me_fit))
+  me_cov_fit <- filt_ts |> ungroup() |> 
+            rstatix::anova_test(data = _, dv = perc_change100, wid = id, within = c(tr),
+                                between = group, covariate = c(age,sex))
+  print(rstatix::get_anova_table(me_cov_fit))
+}  
+
+for (oneroi in c("lstriat","rstriat","lvmpfc","rvmpfc")) {
+  filt_ts <- ts_bysub |> 
+    filter((roi==oneroi) & 
+           (event %in% c("loss")) &
+           (tr<=12)) |> 
+    mutate(perc_change100 = subsig,
+           group = forcats::as_factor(group),
+           tr = forcats::as_factor(tr)) #code tr as a factor bc of non-linear effect on signal
+  filt_ts <- full_join(filt_ts, cov_tib, by = "id")
+    
+  me_fit <- filt_ts |> ungroup() |> 
+            rstatix::anova_test(data = _, dv = perc_change100, wid = id, within = c(tr),
+                                between = group)
+  print(paste(oneroi,"loss"))
+  print(rstatix::get_anova_table(me_fit, correction = "auto"))
+  me_cov_fit <- filt_ts |> ungroup() |> 
+            rstatix::anova_test(data = _, dv = perc_change100, wid = id, within = c(tr),
+                                between = group, covariate = c(age,sex))
+  print(rstatix::get_anova_table(me_cov_fit, correction = "auto"))
+}  
+
+```
+
+### smoking stuff  
+```{r}
+#smoking
+smoke_fit <- t.test(cigs ~ group , data=cov_tib, anova_table = "pes", factorize = FALSE)
+smoke_fit
+temp <- cov_tib |> filter(group == "POUD")
+sd(temp$cigs)
+temp <- cov_tib |> filter(group == "ctl")
+sd(temp$cigs)
+temp <- effectsize::cohens_d(cigs ~ group , data=cov_tib, anova_table = "pes", factorize = FALSE)
+temp$Cohens_d
+```
+
+
+
+### charts   
+```{r}
+hrfgain_tib <- tibble(seconds = seq(0,12,by=.6), 
+                  sigchange=neuRosim::canonicalHRF(seq(0,12,by=.6))*.18
+                  ) |> 
+  mutate(
+    group = "assumed hrf\n(approx)",
+    roi = "lstriat",
+    event = "gain",
+    ci.low = sigchange,
+    ci.upp = sigchange,
+    alphaval = .9
+  )
+hrfloss_tib <- hrfgain_tib |> mutate(event="loss")
+pgrp <- ts_summary |> 
+    filter((roi=="lstriat")&(seconds<=12)&(event %in% c("gain","loss"))) |>
+    mutate(alphaval = 1) |> 
+    bind_rows(hrfgain_tib,hrfloss_tib) |> 
+    mutate( group = as_factor(group)) |> 
+    ggplot(aes(x = seconds, y = sigchange, color=group, fill=group, ymin=ci.low, ymax=ci.upp, alpha = alphaval)) + 
+      geom_point(stat = "identity",size=.5) +
+      geom_line(stat = "identity") +
+      geom_ribbon(alpha=.25, color=NA) +
+      theme_classic(base_size = 10) + labs(title=element_blank(), y = "Signal Change (A.U.)", x = "time after outcome onset (s)") +
+      scale_fill_manual(values = c("#387FE5","#CE2C1E","#000000")) + 
+      scale_color_manual(values = c("#387FE5","#CE2C1E","#000000")) + 
+      scale_x_continuous(breaks=c(0,3,6,9,12)) +
+      guides(alpha="none") +
+      facet_grid(. ~ event)
+  ggsave(filename = "images/lstriat_ts_w_canonical.png", plot = pgrp, device = "png", width = 4, height = 2, units = "in", dpi = 300)
+
+pgrp
+
+```
+
